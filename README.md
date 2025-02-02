@@ -32,6 +32,13 @@ cd Face-Detection
 pip install -r requirements.txt
 ```
 
+3. Download the YOLOv3 weights:
+```bash
+python download_weights.py
+```
+
+Note: The YOLOv3 weights file is large (236.52 MB) and is not included in the repository. The script will download it automatically.
+
 ## Usage
 
 Run the main application:

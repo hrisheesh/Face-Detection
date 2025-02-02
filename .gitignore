@@ -18,10 +18,11 @@ env/
 .vscode/
 
 # Model weights and large files
-*.weights filter=lfs diff=lfs merge=lfs -text
-*.h5 filter=lfs diff=lfs merge=lfs -text
-*.pth filter=lfs diff=lfs merge=lfs -text
-*.onnx filter=lfs diff=lfs merge=lfs -text
+*.weights
+*.h5
+*.pth
+*.onnx
+models/yolov3.weights
 
 # Logs and local files
 *.log

@@ -1,130 +1,173 @@
 import cv2
 import numpy as np
 import mediapipe as mp
-from tensorflow.keras.models import load_model
 from collections import deque
-import tensorflow as tf
 
 class FaceAnalyzer:
     def __init__(self, min_detection_confidence=0.5, min_tracking_confidence=0.5):
-        # Initialize MediaPipe Face Mesh with 3D mesh and enhanced landmark detection
+        # Initialize MediaPipe Face Mesh with optimized settings for better tracking
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
             max_num_faces=1,
             refine_landmarks=True,
             min_detection_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence,
-            static_image_mode=False  # Enable video mode for better tracking
+            static_image_mode=False
         )
-        self.mp_drawing_styles = mp.solutions.drawing_styles
+        
+        # Optimize landmark smoothing parameters
+        self.landmark_buffer = deque(maxlen=3)  # Reduced buffer size for faster response
+        self.smoothing_factor = 0.7  # Increased smoothing factor for stability
+        
+        # Enhanced face tracking parameters
+        self.face_trackers = {}
+        self.next_face_id = 0
+        self.face_timeout = 10  # Reduced for faster cleanup
+        self.min_face_size = 50
+        self.iou_threshold = 0.5
+        
+        # Initialize landmark smoothing
+        self.landmark_buffer = deque(maxlen=5)  # Buffer for temporal smoothing
+        self.last_landmarks = None
+        
+        # Drawing utilities
         self.mp_drawing = mp.solutions.drawing_utils
-        self.tesselation_style = self.mp_drawing_styles.get_default_face_mesh_tesselation_style()
+        self.mp_drawing_styles = mp.solutions.drawing_styles
         
-        # Load pre-trained emotion detection model with custom optimizer config
-        try:
-            self.emotion_model = load_model('models/emotion_model.h5', compile=False)
-            # Recompile the model with updated optimizer configuration
-            self.emotion_model.compile(
-                optimizer=tf.keras.optimizers.Adam(learning_rate=0.0001),
-                loss='categorical_crossentropy',
-                metrics=['accuracy']
+        # Enhanced drawing styles for better visualization
+        self.mesh_drawing_spec = self.mp_drawing.DrawingSpec(
+            color=(0, 255, 0),
+            thickness=1,
+            circle_radius=1
+        )
+        self.connection_drawing_spec = self.mp_drawing.DrawingSpec(
+            color=(255, 255, 255),
+            thickness=1
+        )
+        
+        # Camera matrix for 3D calculations
+        self.camera_matrix = None
+        self.dist_coeffs = np.zeros((4,1))
+    
+    def _enhance_mesh_visibility(self, frame, landmarks):
+        """Enhance mesh visibility with optimized drawing parameters"""
+        # Draw enhanced face mesh with better visibility and smoother lines
+        self.mp_drawing.draw_landmarks(
+            image=frame,
+            landmark_list=landmarks,
+            connections=self.mp_face_mesh.FACEMESH_TESSELATION,
+            landmark_drawing_spec=self.mp_drawing.DrawingSpec(
+                color=(0, 255, 0),
+                thickness=1,
+                circle_radius=1
+            ),
+            connection_drawing_spec=self.mp_drawing.DrawingSpec(
+                color=(255, 255, 255),
+                thickness=1
             )
-        except Exception as e:
-            print(f"Error loading emotion model: {str(e)}")
-            self.emotion_model = None
+        )
         
-        # Emotion labels with more nuanced categories
-        self.emotions = ['Angry', 'Disgust', 'Fear', 'Happy', 'Sad', 'Surprise', 'Neutral', 'Contempt']
+        # Draw contours with improved visibility
+        self.mp_drawing.draw_landmarks(
+            image=frame,
+            landmark_list=landmarks,
+            connections=self.mp_face_mesh.FACEMESH_CONTOURS,
+            landmark_drawing_spec=None,
+            connection_drawing_spec=self.mp_drawing_styles.get_default_face_mesh_contours_style()
+        )
+    
+    def _calculate_face_orientation(self, landmarks):
+        """Calculate face orientation using facial landmarks with improved angle detection"""
+        # Get key facial landmarks for orientation calculation
+        nose_tip = landmarks.landmark[4]  # Nose tip
+        left_eye = landmarks.landmark[33]  # Left eye
+        right_eye = landmarks.landmark[263]  # Right eye
+        mouth_left = landmarks.landmark[61]  # Left mouth corner
+        mouth_right = landmarks.landmark[291]  # Right mouth corner
         
-        # Initialize temporal smoothing with increased buffer
-        self.emotion_buffer = deque(maxlen=10)  # Increased buffer size for better smoothing
-        self.last_emotion = None
+        # Calculate face center with weighted contribution
+        face_points = [left_eye, right_eye, nose_tip, mouth_left, mouth_right]
+        weights = [1.0, 1.0, 1.5, 0.75, 0.75]  # Give more weight to nose tip for better angle detection
+        face_center = np.average([[p.x, p.y, p.z] for p in face_points], axis=0, weights=weights)
         
-        # Initialize FACS-based microexpression detection
-        self.action_units = {
-            'inner_brow_raiser': [27, 28],  # Landmark indices for inner brow movement
-            'outer_brow_raiser': [17, 18, 19],  # Outer brow landmarks
-            'brow_lowerer': [48, 49, 50],  # Brow lowering landmarks
-            'nose_wrinkler': [4, 5, 6],  # Nose wrinkle landmarks
-            'lip_corner_puller': [61, 291],  # Smile landmarks
-            'lip_corner_depressor': [291, 375]  # Frown landmarks
+        # Calculate face normal vector using enhanced cross product method
+        eye_vector = np.array([right_eye.x - left_eye.x, right_eye.y - left_eye.y, right_eye.z - left_eye.z])
+        nose_vector = np.array([nose_tip.x - face_center[0], nose_tip.y - face_center[1], nose_tip.z - face_center[2]])
+        
+        # Normalize vectors for more stable calculations
+        eye_vector = eye_vector / (np.linalg.norm(eye_vector) + 1e-6)
+        nose_vector = nose_vector / (np.linalg.norm(nose_vector) + 1e-6)
+        
+        face_normal = np.cross(eye_vector, nose_vector)
+        face_normal = face_normal / (np.linalg.norm(face_normal) + 1e-6)
+        
+        # Calculate Euler angles with improved stability
+        pitch = np.arctan2(face_normal[1], np.sqrt(face_normal[0]**2 + face_normal[2]**2))
+        yaw = np.arctan2(face_normal[0], face_normal[2])
+        roll = np.arctan2(eye_vector[1], eye_vector[0])
+        
+        # Convert to degrees
+        pitch_deg = float(np.degrees(pitch))
+        yaw_deg = float(np.degrees(yaw))
+        roll_deg = float(np.degrees(roll))
+        
+        # Check if face is turned too much (>35 degrees)
+        is_extreme_angle = abs(yaw_deg) > 35
+        
+        return {
+            'pitch': pitch_deg,
+            'yaw': yaw_deg,
+            'roll': roll_deg,
+            'is_extreme_angle': is_extreme_angle
         }
+
+    def smooth_landmarks(self, landmarks):
+        """Apply enhanced temporal smoothing to landmarks with velocity prediction"""
+        if not landmarks:
+            return self.last_landmarks
         
-    def preprocess_face(self, face_img):
-        """Preprocess face image for emotion detection"""
-        face_img = cv2.resize(face_img, (64, 64))  # Changed to 64x64 to match model's expected input
-        face_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
-        face_img = np.expand_dims(face_img, axis=-1)
-        face_img = np.expand_dims(face_img, axis=0)
-        face_img = face_img / 255.0
-        return face_img
-    
-    def get_face_bbox(self, face_landmarks, image_shape):
-        """Extract face bounding box from landmarks with dynamic padding"""
-        h, w = image_shape[:2]
-        x_coordinates = [landmark.x for landmark in face_landmarks.landmark]
-        y_coordinates = [landmark.y for landmark in face_landmarks.landmark]
+        self.landmark_buffer.append(landmarks)
+        if len(self.landmark_buffer) < 3:
+            return landmarks
         
-        x_min = int(min(x_coordinates) * w)
-        x_max = int(max(x_coordinates) * w)
-        y_min = int(min(y_coordinates) * h)
-        y_max = int(max(y_coordinates) * h)
+        # Enhanced Kalman-like smoothing with velocity prediction
+        weights = np.exp(np.linspace(-2, 0, len(self.landmark_buffer)))
+        weights = weights / np.sum(weights)
         
-        # Dynamic padding based on face size
-        face_width = x_max - x_min
-        face_height = y_max - y_min
-        padding_x = int(face_width * 0.2)
-        padding_y = int(face_height * 0.2)
+        # Calculate velocities for prediction
+        velocities = []
+        for i in range(len(self.landmark_buffer) - 1):
+            curr = self.landmark_buffer[i]
+            next_frame = self.landmark_buffer[i + 1]
+            vel = []
+            for j in range(len(curr.landmark)):
+                vx = next_frame.landmark[j].x - curr.landmark[j].x
+                vy = next_frame.landmark[j].y - curr.landmark[j].y
+                vz = next_frame.landmark[j].z - curr.landmark[j].z
+                vel.append((vx, vy, vz))
+            velocities.append(vel)
         
-        x_min = max(0, x_min - padding_x)
-        y_min = max(0, y_min - padding_y)
-        x_max = min(w, x_max + padding_x)
-        y_max = min(h, y_max + padding_y)
+        # Predict next position using velocity
+        if velocities:
+            avg_velocity = np.average(np.array(velocities), axis=0, weights=weights[:-1])
+            for i in range(len(landmarks.landmark)):
+                # Weighted average of positions
+                positions = np.array([[buffer.landmark[i].x, buffer.landmark[i].y, buffer.landmark[i].z] 
+                                    for buffer in self.landmark_buffer])
+                smoothed_position = np.average(positions, axis=0, weights=weights)
+                
+                # Add predicted velocity component
+                smoothed_position += avg_velocity[i] * 0.5  # Damping factor
+                
+                landmarks.landmark[i].x = float(smoothed_position[0])
+                landmarks.landmark[i].y = float(smoothed_position[1])
+                landmarks.landmark[i].z = float(smoothed_position[2])
         
-        return x_min, y_min, x_max, y_max
-    
-    def detect_microexpressions(self, face_landmarks):
-        """Detect subtle facial movements using FACS-inspired approach"""
-        micro_movements = {}
-        
-        for action, landmark_indices in self.action_units.items():
-            # Calculate movement intensity for each action unit
-            landmarks = [face_landmarks.landmark[idx] for idx in landmark_indices]
-            movement = self._calculate_movement_intensity(landmarks)
-            micro_movements[action] = movement
-        
-        return micro_movements
-    
-    def _calculate_movement_intensity(self, landmarks):
-        """Calculate the intensity of facial muscle movement"""
-        # Simple distance-based calculation for demonstration
-        if len(landmarks) < 2:
-            return 0.0
-        
-        distances = []
-        for i in range(len(landmarks) - 1):
-            dist = np.sqrt((landmarks[i+1].x - landmarks[i].x)**2 +
-                          (landmarks[i+1].y - landmarks[i].y)**2)
-            distances.append(dist)
-        
-        return np.mean(distances)
-    
-    def smooth_emotion(self, emotion):
-        """Apply temporal smoothing to emotion predictions with confidence weighting"""
-        self.emotion_buffer.append(emotion)
-        if len(self.emotion_buffer) < self.emotion_buffer.maxlen:
-            return emotion
-        
-        # Get most common emotion in buffer with weighted voting
-        emotions_count = {}
-        for e in self.emotion_buffer:
-            emotions_count[e] = emotions_count.get(e, 0) + 1
-        
-        smoothed_emotion = max(emotions_count.items(), key=lambda x: x[1])[0]
-        return smoothed_emotion
+        self.last_landmarks = landmarks
+        return landmarks
     
     def analyze_frame(self, frame):
-        """Analyze frame for facial expressions and microexpressions"""
+        """Analyze frame for facial landmarks and mesh"""
         if frame is None:
             return None, None
         
@@ -133,63 +176,38 @@ class FaceAnalyzer:
         results = self.face_mesh.process(rgb_frame)
         
         annotated_frame = frame.copy()
-        emotion_data = None
+        face_data = None
         
         if results.multi_face_landmarks:
             for face_landmarks in results.multi_face_landmarks:
-                # Get face bounding box
-                x_min, y_min, x_max, y_max = self.get_face_bbox(face_landmarks, frame.shape)
-                
-                # Extract and preprocess face region
-                face_roi = frame[y_min:y_max, x_min:x_max]
-                if face_roi.size == 0:
+                # Apply temporal smoothing to landmarks
+                smoothed_landmarks = self.smooth_landmarks(face_landmarks)
+                if smoothed_landmarks is None:
                     continue
                 
-                processed_face = self.preprocess_face(face_roi)
+                # Apply enhanced mesh visualization
+                self._enhance_mesh_visibility(annotated_frame, smoothed_landmarks)
                 
-                # Predict emotion
-                emotion_pred = self.emotion_model.predict(processed_face, verbose=0)[0]
-                emotion_idx = np.argmax(emotion_pred)
-                emotion = self.emotions[emotion_idx]
-                confidence = emotion_pred[emotion_idx]
+                # Calculate face orientation
+                orientation = self._calculate_face_orientation(smoothed_landmarks)
                 
-                # Detect microexpressions
-                micro_movements = self.detect_microexpressions(face_landmarks)
-                
-                # Apply temporal smoothing
-                smoothed_emotion = self.smooth_emotion(emotion)
-                
-                # Draw bounding box and emotion label
-                cv2.rectangle(annotated_frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-                label = f'{smoothed_emotion}: {confidence:.2f}'
-                cv2.putText(annotated_frame, label, (x_min, y_min - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-                
-                # Draw 3D mesh and enhanced facial landmarks
-                self.mp_drawing.draw_landmarks(
-                    image=annotated_frame,
-                    landmark_list=face_landmarks,
-                    connections=self.mp_face_mesh.FACEMESH_TESSELATION,
-                    landmark_drawing_spec=None,
-                    connection_drawing_spec=self.tesselation_style
-                )
-                
-                # Calculate and visualize depth information
-                for landmark in face_landmarks.landmark:
-                    # Convert normalized coordinates to pixel coordinates
-                    x = int(landmark.x * frame.shape[1])
-                    y = int(landmark.y * frame.shape[0])
-                    # Use z-coordinate for depth visualization (red = closer, blue = further)
-                    depth_color = (int(255 * (1-landmark.z)), 0, int(255 * landmark.z))
-                    cv2.circle(annotated_frame, (x, y), 1, depth_color, -1)
-                
-                emotion_data = {
-                    'emotion': smoothed_emotion,
-                    'confidence': float(confidence),
-                    'all_emotions': dict(zip(self.emotions, emotion_pred.tolist())),
-                    'micro_expressions': micro_movements
+                face_data = {
+                    'landmarks': [[l.x, l.y, l.z] for l in smoothed_landmarks.landmark],
+                    'orientation': orientation
                 }
-                
-                self.last_emotion = emotion_data
         
-        return annotated_frame, emotion_data or self.last_emotion
+        return annotated_frame, face_data
+    
+    def _calculate_iou(self, box1, box2):
+        """Calculate Intersection over Union between two bounding boxes"""
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+        
+        intersection = max(0, x2 - x1) * max(0, y2 - y1)
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
